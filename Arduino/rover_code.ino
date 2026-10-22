@@ -4,9 +4,9 @@
 #include <math.h>
 
 // ---------- WIFI SETTINGS ----------
-const char* ssid = "SRINIVASAPG 1F_2.4G";
-const char* password = "8790351401";
-String serverURL = "http://192.168.1.37/rover/api.php?action=";
+const char* ssid = "WiFi_NAME";
+const char* password = "WiFi_PASSAWORD";
+String serverURL = "http://"IP_ADDRESS"/rover/api.php?action=";
 
 // ---------- MOTOR PINS (ESP32 DevKit Safe) ----------
 const int L1 = 25;
@@ -62,6 +62,10 @@ float roverY = 50;
 float roverAngle = 90;  // Initial facing north (up, -Y)
 bool autoMode = false;
 String currentCommand = "stop";
+float serverTurnA = 0;
+float serverTurnT = 0;
+float serverMoveT = 0;
+String lastExecutedReturn = "";
 
 // ---------- WAYPOINT STRUCT ----------
 struct WP { float x; float y; int pathIdx; };
@@ -153,6 +157,9 @@ void fetchServer(){
         return;
       }
       currentCommand = doc["command"] | "stop";
+      serverTurnA = doc["turnA"] | 0.0f;
+      serverTurnT = doc["turnT"] | 0.0f;
+      serverMoveT = doc["moveT"] | 0.0f;
       Serial.println("Command received: " + currentCommand);
 
       // Check for reset flag
@@ -195,14 +202,15 @@ void fetchServer(){
         }
       }
 
-      autoMode = doc["goto"] | false;
-      currentWPIndex = doc["currentWP"] | 0;
-      if(autoMode != prevAutoMode){
-        if(autoMode) {
-          Serial.println("Autonomous mode started. Waypoints: " + String(totalWP));
-        }
-        prevAutoMode = autoMode;
+      bool serverAutoMode = doc["goto"] | false;
+      // Only sync currentWP when auto mode is first enabled.
+      // Prevents a stale server value resetting the locally advancing waypoint.
+      if(serverAutoMode && !prevAutoMode) {
+        currentWPIndex = doc["currentWP"] | 0;
+        Serial.println("Autonomous mode started. Waypoints: " + String(totalWP));
       }
+      autoMode = serverAutoMode;
+      prevAutoMode = serverAutoMode;
     } else {
       Serial.println("Server GET failed: " + String(code));
     }
@@ -276,11 +284,31 @@ void autoMove(){
     delay(200); 
     return; 
   }
-  if(obstacleDetected()){ 
-    stopMotors(); 
-    sendRoverPosition(true); 
-    delay(150);
-    return; 
+  // Basic reactive obstacle avoidance: steer toward the side with more clearance.
+  long leftDistance = readDistance(trigL, echoL);
+  long rightDistance = readDistance(trigR, echoR);
+  bool leftBlocked = (leftDistance > 0 && leftDistance < 20);
+  bool rightBlocked = (rightDistance > 0 && rightDistance < 20);
+
+  if(leftBlocked || rightBlocked) {
+    Serial.println("Obstacle detected: attempting a short avoidance maneuver.");
+    if(leftBlocked && rightBlocked) {
+      moveBackward();
+      updatePosition(-stepDist, -stepDist);
+      delay(250);
+    } else if(leftBlocked) {
+      turnRight();
+      updatePosition(0, stepDist);
+      delay(250);
+    } else {
+      turnLeft();
+      updatePosition(stepDist, 0);
+      delay(250);
+    }
+    stopMotors();
+    sendRoverPosition(true);
+    delay(100);
+    return;
   }
 
   int target_idx = t.pathIdx;
@@ -294,7 +322,7 @@ void autoMove(){
 
     float deltaL = 0;
     float deltaR = 0;
-    if(fabs(angleDiff) > 3.0){
+    if(fabs(angleDiff) > 8.0){
       if(angleDiff > 0){
         deltaL = stepDist; deltaR = 0;
         turnLeft();
@@ -321,13 +349,31 @@ void autoMove(){
         curr_idx = i;
       }
     }
-    if(curr_idx == -1 || curr_idx >= target_idx){
+    if(target_idx < 0 || target_idx >= pathSize) {
+      Serial.println("Invalid waypoint pathIndex; using direct navigation.");
+      float targetAngle = atan2(roverY - t.y, t.x - roverX) * 180.0 / PI;
+      if(targetAngle < 0) targetAngle += 360;
+      float angleDiff = targetAngle - roverAngle;
+      while(angleDiff > 180) angleDiff -= 360;
+      while(angleDiff < -180) angleDiff += 360;
+      if(fabs(angleDiff) > 8.0) {
+        if(angleDiff > 0) { turnLeft(); updatePosition(stepDist, 0); }
+        else { turnRight(); updatePosition(0, stepDist); }
+      } else {
+        moveForward(); updatePosition(stepDist, stepDist);
+      }
+      sendRoverPosition(false);
+      delay(150);
+      return;
+    }
+
+    if(curr_idx == -1) {
       stopMotors();
       delay(150);
       return;
     }
 
-    // Next point on path
+    // Next point on path, clamped to this waypoint's path index.
     int next_idx = curr_idx + 1;
     if(next_idx > target_idx) next_idx = target_idx;
     float nx = pathX[next_idx];
@@ -344,7 +390,7 @@ void autoMove(){
 
     float deltaL = 0;
     float deltaR = 0;
-    if(fabs(angleDiff) > 3.0){
+    if(fabs(angleDiff) > 8.0){
       if(angleDiff > 0){
         deltaL = stepDist; deltaR = 0;
         turnLeft();
@@ -360,6 +406,80 @@ void autoMove(){
   }
   sendRoverPosition(false);
   delay(150);
+}
+
+// ---------- DASHBOARD RETURN COMMAND ----------
+void setServerCommandStop() {
+  HTTPClient http;
+  String url = "http://"IP_ADDRESS"/rover/api.php?command=stop";
+  if (http.begin(url)) {
+    http.GET();
+    http.end();
+  }
+  currentCommand = "stop";
+}
+
+// Run a timed dashboard turn/move command once. The dashboard expects the
+// server command to return to "stop" when the movement has finished.
+void executeReturnCommand() {
+  Serial.println("Executing dashboard return command");
+
+  // Turn direction is based on signed turnA; turnT is milliseconds.
+  unsigned long turnMs = (unsigned long)constrain((long)serverTurnT, 0L, 10000L);
+  unsigned long moveMs = (unsigned long)constrain((long)serverMoveT, 0L, 15000L);
+
+  if (turnMs > 0 && fabs(serverTurnA) > 1.0f) {
+    if (serverTurnA > 0) turnLeft();
+    else turnRight();
+
+    unsigned long start = millis();
+    while (millis() - start < turnMs) {
+      // Stop turning if a close obstacle is detected.
+      long l = readDistance(trigL, echoL);
+      long r = readDistance(trigR, echoR);
+      if ((l > 0 && l < 15) || (r > 0 && r < 15)) {
+        stopMotors();
+        Serial.println("Return command stopped: obstacle during turn");
+        setServerCommandStop();
+        sendRoverPosition(true);
+        return;
+      }
+      delay(20);
+    }
+    stopMotors();
+    // Approximate heading update; actual angle depends on motor speed and battery.
+    roverAngle += (serverTurnA > 0 ? 1.0f : -1.0f) * turnMs * 0.07f;
+    while (roverAngle < 0) roverAngle += 360;
+    while (roverAngle >= 360) roverAngle -= 360;
+  }
+
+  // Move forward in short intervals so the ultrasonic sensors can stop it.
+  unsigned long moved = 0;
+  while (moved < moveMs) {
+    long l = readDistance(trigL, echoL);
+    long r = readDistance(trigR, echoR);
+    if ((l > 0 && l < 15) || (r > 0 && r < 15)) {
+      stopMotors();
+      Serial.println("Return command stopped: obstacle during forward movement");
+      setServerCommandStop();
+      sendRoverPosition(true);
+      return;
+    }
+    moveForward();
+    delay(40);
+    moved += 40;
+  }
+
+  stopMotors();
+  // Position is an estimate only; without encoders/GPS it is not measured pose.
+  float estimatedDistance = moveMs * 0.022f;
+  float rad = roverAngle * PI / 180.0f;
+  roverX += estimatedDistance * cos(rad);
+  roverY -= estimatedDistance * sin(rad);
+  sendRoverPosition(false);
+  setServerCommandStop();
+  currentCommand = "stop";
+  Serial.println("Return command completed.");
 }
 
 // ---------- SETUP ----------
@@ -379,6 +499,13 @@ void setup(){
 // ---------- LOOP ----------
 void loop(){
   fetchServer();
+
+  if (currentCommand == "return") {
+    executeReturnCommand();
+    delay(50);
+    return;
+  }
+
   if(autoMode) autoMove();
   else manualMove();
 }
