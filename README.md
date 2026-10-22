@@ -1,4 +1,4 @@
-# VitaGo – AI-Based Smart Car System for Patient Monitoring
+# VitaGo – Autonomos Smart Car System for Patient Monitoring
 
 ## 📌 Project Overview
 
