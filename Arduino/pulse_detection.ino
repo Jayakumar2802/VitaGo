@@ -2,9 +2,9 @@
 #include <HTTPClient.h>
 #include "esp_task_wdt.h"
 
-const char* ssid = "SRINIVASAPG 1F_2.4G";
-const char* password = "8790351401";
-const char* serverUrl = "http://192.168.1.37/rover/api_monitor.php";
+const char* ssid = "WIFI_NAME";
+const char* password = "WIFI_PASSAWORD";
+const char* serverUrl = "http://"IP_ADDRESS"/rover/api_monitor.php";
 
 const int sensorPin = 34;   
 const int loPlus = 14;     
